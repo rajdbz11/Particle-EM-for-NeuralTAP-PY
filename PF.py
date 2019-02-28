@@ -4,20 +4,24 @@ from scipy import signal
 from scipy import sparse
 from scipy import optimize
 from sklearn.decomposition import FastICA
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.io import loadmat
+from scipy.io import savemat
 
 def Create_J(Nx, sp, Jtype, SelfCoupling):
     
     """
-    Generate a sparse, symmetric coupling matrix with desiredkind of itneractions
+    Generate a sparse, symmetric coupling matrix with desired kind of interactions
 
     Inputs: 
     Nx    : No. of x's
     sp    : degree of sparsity of J
-    Jtype : type of J matrix. ferr, antiferr, nonferr
+    Jtype : coupling type - ferromagnetic (all positive), antiferr (all negative), nonferr (mixed)
     SelfCoupling: determines if J matrix has self coupling or not
 
     Output
-    J     : coupling matrix of the Ising model
+    J     : coupling matrix
     """
 
     # Create the mask for zeros
@@ -59,7 +63,7 @@ def generateBroadH(Nx,T,Th,scaling):
     Modeling h(t) such that it stays constant for every Nh time steps.
     """    
 
-    # irst generate only T/Nh independent values of h
+    # First generate only T/Nh independent values of h
     shape = 1 # gamma shape parameter
     Lh = np.int(T//Th)
     gsmScale = np.random.gamma(shape,scaling,(Nx,Lh))
@@ -71,6 +75,7 @@ def generateBroadH(Nx,T,Th,scaling):
         hMat[:,t] = hInd[:,np.int(t//Th)]
         
     return hMat
+
 
 def nonlinearity(x,nltype):
 
@@ -151,7 +156,7 @@ def runTAP(x0, hMat, Qpr, Qobs, theta, nltype):
     Nx = Qpr.shape[0]  # latent dimensions
     Nr = Qobs.shape[0] # output dimensions
 
-    lG = 5 # hard coded for now
+    lG = 18 # hard coded for now
     lam, G, J, U, V = extractParams(theta, lG, Nx, Nh, Nr)
 
     x = x0 # initial value of x
@@ -162,8 +167,19 @@ def runTAP(x0, hMat, Qpr, Qobs, theta, nltype):
     J2 = J**2
 
     for tt in range(T):  
+        
         ht = hMat[:,tt]
-        argf = np.dot(V,ht) + G[0]*np.dot(J,x) + G[1]*np.dot(J2,x) + G[2]*np.dot(J2,x**2) + G[3]*x*np.dot(J2,x) + G[4]*x*np.dot(J2,x**2)
+
+        x2      = x**2
+        J1      = np.dot(J,np.ones([Nx]))
+        Jx      = np.dot(J,x)
+        Jx2     = np.dot(J,x2)
+        J21     = np.dot(J2,np.ones([Nx]))
+        J2x     = np.dot(J2,x)
+        J2x2    = np.dot(J2,x2)
+
+        argf = np.dot(V,ht) + G[0]*J1 + G[1]*Jx + G[2]*Jx2 + G[9]*J21 + G[10]*J2x + G[11]*J2x2 + x*( G[3]*J1 + G[4]*Jx + G[5]*Jx2 + G[12]*J21 + G[13]*J2x + G[14]*J2x2 ) + x2*(G[6]*J1 + G[7]*Jx + G[8]*Jx2 + G[15]*J21 + G[16]*J2x + G[17]*J2x2)
+        
         TAPFn = nonlinearity(argf, nltype)[0]
         xnew = (1-lam)*x + lam*TAPFn + np.random.multivariate_normal(np.zeros(Nx),Qpr)
         xMat[:,tt+1] = xnew
@@ -173,28 +189,68 @@ def runTAP(x0, hMat, Qpr, Qobs, theta, nltype):
 
     return xMat, rMat
 
+
+
 def UhatICA(R, Nx, U):
-    ica = FastICA(n_components=Nx, algorithm='deflation',fun='cube')
-    # R = np.reshape(rMatFull,[Nr,T*Ns],order='F').T
-    Xe = ica.fit_transform(R)  # Reconstruct signals
-    Uhat = ica.mixing_  # Get estimated mixing matrix
-    m = ica.mean_
+	"""
+	Function to recover initial estimate of the embedding matrix U
+	from the latent dynamics using ICA
+	"""
 
-    Xe = Xe + np.dot(np.linalg.pinv(Uhat),m)
+	ica = FastICA(n_components=Nx, algorithm='deflation',fun='cube')
+	# R = np.reshape(rMatFull,[Nr,T*Ns],order='F').T
+	Xe = ica.fit_transform(R)  # Reconstruct signals
+	Uhat = ica.mixing_  # Get estimated mixing matrix
+	m = ica.mean_
 
-    minx = np.min(Xe,axis=0)
-    maxx = np.max(Xe,axis=0)
-    DW = np.zeros([Nx])
-    for ii in range(Nx):
-        if abs(minx[ii]) > abs(maxx[ii]):
-            DW[ii] = minx[ii]
-        else:
-            DW[ii] = maxx[ii]
+	Xe = Xe + np.dot(np.linalg.pinv(Uhat),m)
 
-    Uhat = Uhat*DW
-    Xe = Xe/DW
-    P = np.round(np.dot(np.linalg.pinv(Uhat),U))
-    return Uhat, P, Xe.T
+	minx = np.min(Xe,axis=0)
+	maxx = np.max(Xe,axis=0)
+	DW = np.zeros([Nx])
+	for ii in range(Nx):
+	    if abs(minx[ii]) > abs(maxx[ii]):
+	        DW[ii] = minx[ii]
+	    else:
+	        DW[ii] = maxx[ii]
+
+	Uhat = Uhat*DW
+	Xe = Xe/DW
+	P = np.round(np.dot(np.linalg.pinv(Uhat),U))
+	return Uhat, P, Xe.T
+
+
+def EstimatePermutation_ICA(U,U_1):
+	"""
+	Function that estimates the permutation matrix for ICA estimate of the embedding U
+	Inputs:
+		U 		ground truth embedding
+		U_1 	ICA estimate of embedding
+	Outputs:
+		P 		permutation matrix such that U = U_1 x P
+	"""
+	Nx = U.shape[1]
+	P = np.zeros([Nx,Nx])
+
+	for i in range(Nx):
+	    err = np.sum((np.expand_dims(U_1[:,i],1) - U)**2, axis=0)
+	    idx = np.argsort(err)
+	      
+	    if i == 0:
+	        taken = np.array([idx[0]])
+	        P[i,idx[0]] = 1
+	    else:
+	        k = 0
+	        while np.intersect1d(idx[k], taken).shape[0] != 0:
+	            k += 1
+	            
+	        P[i,idx[k]] = 1
+	        taken = np.append(taken, idx[k])
+
+	return P
+
+
+
     
 def resampleSystematic(w, N):
     """
@@ -262,7 +318,7 @@ def particlefilter(rMat, hMat, K, P, M, theta, nltype):
     Nx = P.shape[1]
     Nh = hMat.shape[0]
     
-    lG = 5
+    lG = 18
     lam, G, J, U, V = extractParams(theta, lG, Nx, Nh, Nr)
     UT = U.T
     J2 = J**2
@@ -295,8 +351,17 @@ def particlefilter(rMat, hMat, K, P, M, theta, nltype):
 
         # sampling x(t) from the proposal distribution p(x(t)|x(t-1), r(t))
         # p(x(t)|x(t-1),r(t)) = 1/Z*p(x(t)|x(t-1))*p(r(t)|x(t))
+
+        x2      = x**2
+        J1      = np.expand_dims(np.dot(J,np.ones([Nx])),1)
+        Jx      = np.dot(J,x)
+        Jx2     = np.dot(J,x2)
+        J21     = np.expand_dims(np.dot(J2,np.ones([Nx])),1)
+        J2x     = np.dot(J2,x)
+        J2x2    = np.dot(J2,x2)
+
+        argf = np.expand_dims(np.dot(V,ht),1) + G[0]*J1 + G[1]*Jx + G[2]*Jx2 + G[9]*J21 + G[10]*J2x + G[11]*J2x2 + x*( G[3]*J1 + G[4]*Jx + G[5]*Jx2 + G[12]*J21 + G[13]*J2x + G[14]*J2x2 ) + x2*(G[6]*J1 + G[7]*Jx + G[8]*Jx2 + G[15]*J21 + G[16]*J2x + G[17]*J2x2)
         
-        argf = np.dot(V,ht).reshape([Nx,1]) + G[0]*np.dot(J,x) + G[1]*np.dot(J2,x) + G[2]*np.dot(J2,x**2) + G[3]*x*np.dot(J2,x) + G[4]*x*np.dot(J2,x**2)
         outmat = nonlinearity(argf, nltype)[0]
         f_tap = (1-lam)*x + lam*outmat
         Pinvf_tap = np.linalg.solve(P,f_tap)
@@ -365,7 +430,7 @@ def NegLL(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
     Nx, K = P_S.shape[0:2] # No. of latent variables and no. of particles  
     Nh    = hMat.shape[0]  # input dimension
 
-    lG = 5
+    lG = 18
     lam, G, J, U, V = extractParams(theta, lG, Nx, Nh, Nr)
     UT = U.T
     J2 = J**2
@@ -380,8 +445,17 @@ def NegLL(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
         ht      = hMat[:,t]
         x       = P_S[:,:,t]
         x_curr  = P_S[:,:,t+1]
-        
-        argf   = np.dot(V,ht).reshape([Nx,1]) + G[0]*np.dot(J,x) + G[1]*np.dot(J2,x) + G[2]*np.dot(J2,x**2) + G[3]*x*np.dot(J2,x) + G[4]*x*np.dot(J2,x**2)
+
+        x2      = x**2
+        J1      = np.expand_dims(np.dot(J,np.ones([Nx])),1)
+        Jx      = np.dot(J,x)
+        Jx2     = np.dot(J,x2)
+        J21     = np.expand_dims(np.dot(J2,np.ones([Nx])),1)
+        J2x     = np.dot(J2,x)
+        J2x2    = np.dot(J2,x2)
+
+        argf = np.expand_dims(np.dot(V,ht),1) + G[0]*J1 + G[1]*Jx + G[2]*Jx2 + G[9]*J21 + G[10]*J2x + G[11]*J2x2 + x*( G[3]*J1 + G[4]*Jx + G[5]*Jx2 + G[12]*J21 + G[13]*J2x + G[14]*J2x2 ) + x2*(G[6]*J1 + G[7]*Jx + G[8]*Jx2 + G[15]*J21 + G[16]*J2x + G[17]*J2x2)
+
         fx      = nonlinearity(argf,nltype)[0]
         x_pred  = (1-lam)*x + lam*fx
         dx      = x_curr - x_pred
@@ -436,7 +510,7 @@ def NegLL_D(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
     Nx, K = P_S.shape[0:2] # No. of latent variables and no. of particles  
     Nh    = hMat.shape[0]  # input dimension
 
-    lG = 5
+    lG = 18
     lam, G, J, U, V = extractParams(theta, lG, Nx, Nh, Nr)
     UT = U.T
     J2 = J**2
@@ -455,14 +529,23 @@ def NegLL_D(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
         ht      = hMat[:,t]
         x       = P_S[:,:,t]
         x_curr  = P_S[:,:,t+1]
-        
-        argf    = np.dot(V,ht).reshape([Nx,1]) + G[0]*np.dot(J,x) + G[1]*np.dot(J2,x) + G[2]*np.dot(J2,x**2) + G[3]*x*np.dot(J2,x) + G[4]*x*np.dot(J2,x**2)
+
+        x2      = x**2
+        J1      = np.expand_dims(np.dot(J,np.ones([Nx])),1)
+        Jx      = np.dot(J,x)
+        Jx2     = np.dot(J,x2)
+        J21     = np.expand_dims(np.dot(J2,np.ones([Nx])),1)
+        J2x     = np.dot(J2,x)
+        J2x2    = np.dot(J2,x2)
+
+        argf = np.expand_dims(np.dot(V,ht),1) + G[0]*J1 + G[1]*Jx + G[2]*Jx2 + G[9]*J21 + G[10]*J2x + G[11]*J2x2 + x*( G[3]*J1 + G[4]*Jx + G[5]*Jx2 + G[12]*J21 + G[13]*J2x + G[14]*J2x2 ) + x2*(G[6]*J1 + G[7]*Jx + G[8]*Jx2 + G[15]*J21 + G[16]*J2x + G[17]*J2x2)
+
         fx, dfx = nonlinearity(argf,nltype)
         x_pred  = (1-lam)*x + lam*fx
         dx      = x_curr - x_pred
         dr      = r_t.reshape([Nr,1]) - np.dot(U,x_curr)
 
-        x2      = x**2
+        
         Pinvdx  = np.linalg.solve(P,dx)
         Im1     = lam*Pinvdx*WVec.reshape([1,K])*dfx
         
@@ -480,23 +563,44 @@ def NegLL_D(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
 
         # gradient for G
         if computegrad[0] == 1:
-            dG[0]   = dG[0] - np.sum(Im1*np.dot(J,x)) 
-            dG[1]   = dG[1] - np.sum(Im1*np.dot(J2,x))
-            dG[2]   = dG[2] - np.sum(Im1*np.dot(J2,x2)) 
-            dG[3]   = dG[3] - np.sum(Im1*x*np.dot(J2,x))
-            dG[4]   = dG[4] - np.sum(Im1*x*np.dot(J2,x2)) 
+            dG[0]   = dG[0] - np.sum(Im1*J1) 
+            dG[1]   = dG[1] - np.sum(Im1*Jx)
+            dG[2]   = dG[2] - np.sum(Im1*Jx2) 
+            dG[3]   = dG[3] - np.sum(Im1*x*J1)
+            dG[4]   = dG[4] - np.sum(Im1*x*Jx) 
+            dG[5]   = dG[5] - np.sum(Im1*x*Jx2) 
+            dG[6]   = dG[6] - np.sum(Im1*x2*J1)
+            dG[7]   = dG[7] - np.sum(Im1*x2*Jx) 
+            dG[8]   = dG[8] - np.sum(Im1*x2*Jx2)
+            dG[9]   = dG[9] - np.sum(Im1*J21) 
+            dG[10]   = dG[10] - np.sum(Im1*J2x)
+            dG[11]   = dG[11] - np.sum(Im1*J2x2) 
+            dG[12]   = dG[12] - np.sum(Im1*x*J21)
+            dG[13]   = dG[13] - np.sum(Im1*x*J2x) 
+            dG[14]   = dG[14] - np.sum(Im1*x*J2x2) 
+            dG[15]   = dG[15] - np.sum(Im1*x2*J21)
+            dG[16]   = dG[16] - np.sum(Im1*x2*J2x) 
+            dG[17]   = dG[17] - np.sum(Im1*x2*J2x2)
+            
 
         # gradient for J 
+    
         if computegrad[1] == 1:
             for ii in range(Nx):
                 for jj in range(ii + 1):
                     dA = np.zeros([Nx,K])
-                    if ii == jj:
-                        dA[ii,:] = G[0]*x[ii,:] + 2*J[ii,ii]*( G[1]*x[ii,:] + (G[2] + G[3])*x2[ii,:] +  G[4]*(x[ii,:]**3) )
-                    else:
-                        dA[ii,:] = G[0]*x[jj,:] + 2*J[ii,jj]*( G[1]*x[jj,:] + G[2]*x2[jj,:] + G[3]*(x[ii,:]*x[jj,:]) +  G[4]*(x[ii,:]*x2[jj,:]) )
+                    xi = x[ii,:]
+                    xj = x[jj,:]
+                    x2i = x2[ii,:]
+                    x2j = x2[jj,:]
+                    Jij = J[ii,jj]
 
-                        dA[jj,:] = G[0]*x[ii,:] + 2*J[ii,jj]*( G[1]*x[ii,:] + G[2]*x2[ii,:] + G[3]*(x[jj,:]*x[ii,:]) +  G[4]*(x[jj,:]*x2[ii,:]) )
+                    if ii == jj:
+                        dA[ii,:] = G[0] + G[1]*xj + G[2]*x2j + G[3]*xi + G[4]*xi*xj + G[5]*xi*x2j + G[6]*x2i + G[7]*x2i*xj + G[8]*x2i*x2j + 2*Jij*(G[9] + G[10]*xj + G[11]*x2j + G[12]*xi + G[13]*xi*xj + G[14]*xi*x2j + G[15]*x2i + G[16]*x2i*xj + G[17]*x2i*x2j)
+                    else:
+                        dA[ii,:] = G[0] + G[1]*xj + G[2]*x2j + G[3]*xi + G[4]*xi*xj + G[5]*xi*x2j + G[6]*x2i + G[7]*x2i*xj + G[8]*x2i*x2j + 2*Jij*(G[9] + G[10]*xj + G[11]*x2j + G[12]*xi + G[13]*xi*xj + G[14]*xi*x2j + G[15]*x2i + G[16]*x2i*xj + G[17]*x2i*x2j)
+
+                        dA[jj,:] = G[0] + G[1]*xi + G[2]*x2i + G[3]*xj + G[4]*xj*xi + G[5]*xj*x2i + G[6]*x2j + G[7]*x2j*xi + G[8]*x2j*x2i + 2*Jij*(G[9] + G[10]*xi + G[11]*x2i + G[12]*xj + G[13]*xj*xi + G[14]*xj*x2i + G[15]*x2j + G[16]*x2j*xi + G[17]*x2j*x2i)
 
                     dJ[ii,jj] = dJ[ii,jj] - np.sum(Im1*dA)
                     
