@@ -8,6 +8,67 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.io import loadmat
 from scipy.io import savemat
+import pickle
+
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torch.autograd import Variable
+from torch import optim
+import torch.nn.init as init
+
+class RNN(nn.Module):
+    """
+    -- RNN model class --
+    Architecture:
+    Input layer --> Hidden recurrent layer --> Output recurrent layer
+    """
+
+    def __init__(self, input_dim, hidden_dim, output_dim, use_cuda):
+        super(RNN, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.use_cuda = use_cuda
+        
+        self.input_to_hidden = nn.Linear(input_dim + hidden_dim, hidden_dim, bias = True)
+        self.hidden_to_output = nn.Linear(hidden_dim + output_dim, output_dim, bias = True)
+        self.activation_function = nn.ReLU()
+        
+    
+    def forward(self, inputs):
+        
+        N_batches, T = inputs.shape[0], inputs.shape[1]
+        
+        # Initialize the activity of the recurrent layers
+        output_activity, hidden_activity = torch.rand(N_batches, self.output_dim), torch.rand(N_batches, self.hidden_dim)
+        output_activity = np.sqrt(self.output_dim)*output_activity
+        hidden_activity = np.sqrt(self.hidden_dim)*hidden_activity
+        
+        r = torch.zeros(N_batches, T, self.output_dim) # output layer activity
+        h = torch.zeros(N_batches, T, self.hidden_dim) # hidden layer activity
+        
+        if self.use_cuda and torch.cuda.is_available():
+            r = r.cuda()
+            h = h.cuda()
+            output_activity = output_activity.cuda()
+            hidden_activity = hidden_activity.cuda()
+        
+        for t in range(T):
+            
+            combined_inputs_hiddenlayer = torch.cat((inputs[:,t,:], hidden_activity),1)
+            hidden_activity = self.activation_function(self.input_to_hidden(combined_inputs_hiddenlayer))
+            
+            combined_inputs_outputlayer = torch.cat((hidden_activity, output_activity),1)
+            output_activity = self.activation_function(self.hidden_to_output(combined_inputs_outputlayer))
+            
+            r[:,t,:] = output_activity
+            h[:,t,:] = hidden_activity
+        
+        return r, h
+
+
 
 def Create_J(Nx, sp, Jtype, SelfCoupling):
     
@@ -65,16 +126,17 @@ def generateBroadH(Nx,T,Th,scaling):
 
     # First generate only T/Nh independent values of h
     shape = 1 # gamma shape parameter
-    Lh = np.int(T//Th)
+    Lh = T//Th + 1*(T%Th != 0)
     gsmScale = np.random.gamma(shape,scaling,(Nx,Lh))
     hInd = gsmScale*np.random.randn(Nx,Lh)
     hMat = np.zeros([Nx,T])
 
     # Then repeat each independent h for Nh time steps
     for t in range(T):
-        hMat[:,t] = hInd[:,np.int(t//Th)]
+        hMat[:,t] = hInd[:,t//Th]
         
     return hMat
+
 
 
 def nonlinearity(x,nltype):
@@ -191,7 +253,7 @@ def runTAP(x0, hMat, Qpr, Qobs, theta, nltype):
 
 
 
-def UhatICA(R, Nx, U):
+def UhatICA(R, Nx):
 	"""
 	Function to recover initial estimate of the embedding matrix U
 	from the latent dynamics using ICA
@@ -216,8 +278,8 @@ def UhatICA(R, Nx, U):
 
 	Uhat = Uhat*DW
 	Xe = Xe/DW
-	P = np.round(np.dot(np.linalg.pinv(Uhat),U))
-	return Uhat, P, Xe.T
+	
+	return Uhat, Xe.T
 
 
 def EstimatePermutation_ICA(U,U_1):
@@ -401,7 +463,7 @@ def particlefilter(rMat, hMat, K, P, M, theta, nltype):
     
     return LL, xhat, ParticlesAll, WVec
 
-def NegLL(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
+def NegLL(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad, alpha_J, alpha_G):
     
     """
     % Function for computing the Log Likelihood cost for the probabilistic
@@ -421,6 +483,9 @@ def NegLL(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
     % J     :coupling matrix
     % U     :embedding matrix, r = Ux + noise
     % V     :embedding of input
+    % alpha_J       : scaling of L1 norm of J
+    % alpha_G       : scaling of L1 norm of G
+
 
     % Output: 
     % Cost C and gradient w.r.t G 
@@ -465,16 +530,14 @@ def NegLL(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
         C1 = C1 + 0.5*np.dot(np.sum(dx*np.linalg.solve(P,dx),axis=0), WVec)
         C2 = C2 + 0.5*np.dot(np.sum(dr*np.linalg.solve(M,dr),axis=0), WVec)
 
-    C = C1 + C2
 
-    # Add L1 norm of J and L2 norm of G
-    a1 = 0
-    a2 = 0
-    C = C + a1*sum(G**2) + a2*sum(abs(JMatToVec(J)))
+    
+    # Add the L1 norms of G and J
+    C = C1 + C2 + alpha_G*sum(np.abs(G)) + alpha_J*sum(np.abs(JMatToVec(J)))
     
     return C
 
-def NegLL_D(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
+def NegLL_D(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad, alpha_J, alpha_G):
 
     """
     % Function for computing the derivatives of Log Likelihood cost for the probabilistic
@@ -500,6 +563,8 @@ def NegLL_D(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
     % computegrad(3): U
     % computegrad(4): V
     % computegrad(5): lam
+    % alpha_J       : scaling of L1 norm of J
+    % alpha_G       : scaling of L1 norm of G
 
 
     % Output: 
@@ -606,12 +671,12 @@ def NegLL_D(theta, rMat, hMat, P_S, WVec, P, M, nltype, computegrad):
                     
 
     # Add gradient of L2 norm of G
-    a1 = 0
-    dG = dG + a1*2*G
+    #alpha_G = 0
+    dG = dG + alpha_G*np.sign(G)
     
     # Add gradient of L1 norm of J
-    a2 = 0
-    dJ = dJ + a2*np.sign(J)
+    #alpha_J = 0
+    dJ = dJ + alpha_J*np.sign(J)
     dJ = JMatToVec(dJ)
 
     dtheta = np.concatenate([dlam, dG, dJ, dU.flatten('F'), dV.flatten('F') ])
